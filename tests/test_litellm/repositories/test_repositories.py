@@ -561,9 +561,10 @@ class TestTeamRepository:
 
         assert [m.user_id for m in members] == expected_ids
         sql = tx.query_raw.call_args.args[0]
-        assert "FOR UPDATE" not in sql, (
-            "a row lock here can deadlock with the access-group endpoints; the caller must "
-            "already hold the team's advisory lock, so a plain read is all this needs"
+        assert "FOR UPDATE" in sql and "pg_advisory" not in sql, (
+            "this read must itself take the team row lock; CockroachDB has no advisory "
+            "locks, and the access-group endpoints lock team rows first so this cannot "
+            "deadlock with them"
         )
         assert tx.query_raw.call_args.args[1] == "team-1"
 
@@ -571,7 +572,7 @@ class TestTeamRepository:
     async def test_get_members_with_roles_locked_missing_row(self, repo):
         """None, not [], so a caller can tell a deleted team from an empty one.
 
-        /team/member_add reconciles membership under the team's advisory lock and has to
+        A missing row also means FOR UPDATE locked nothing, so /team/member_add has to
         fail, without writing anything, when a /team/delete committed underneath it. An
         empty list would look like a live team with no members and it would carry on writing.
         """

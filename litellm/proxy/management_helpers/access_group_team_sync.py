@@ -22,14 +22,16 @@ from pydantic import BaseModel, TypeAdapter
 
 from litellm.proxy.auth.auth_checks import _delete_cache_access_object
 
-# hashtext collisions only cost two unrelated teams a little serialization, and the
-# lock is never taken by the access-group endpoints as a SELECT ... FOR UPDATE row lock,
-# so it cannot join their access-group-then-team lock order to form a cycle. team_endpoints
-# reuses this exact statement to serialize /team/member_add and /team/delete against each
-# other and against this mirror, rather than defining a second, divergent lock on the same key.
-TEAM_ADVISORY_LOCK_SQL: Final = "SELECT pg_advisory_xact_lock(hashtext($1)) IS NULL AS locked"
+# Team writes serialize on the team row itself (CockroachDB has no pg_advisory_xact_lock
+# or hashtext, so the previous advisory lock was not portable). Global lock order every
+# writer of these two tables must respect: LiteLLM_TeamTable rows first, in sorted team_id
+# order when locking several, LiteLLM_AccessGroupTable rows after. The access-group
+# endpoints lock the affected team rows up front for this reason, so their writes cannot
+# form a cycle with the team-then-group order used here. A team_id with no row locks
+# nothing; each call site handles that case itself.
+TEAM_ROW_LOCK_SQL: Final = 'SELECT team_id FROM "LiteLLM_TeamTable" WHERE team_id = $1 FOR UPDATE'
 
-_READ_TEAM_SQL: Final = 'SELECT access_group_ids FROM "LiteLLM_TeamTable" WHERE team_id = $1'
+_LOCK_AND_READ_TEAM_SQL: Final = 'SELECT access_group_ids FROM "LiteLLM_TeamTable" WHERE team_id = $1 FOR UPDATE'
 
 # The groups the team is on either side of the reconcile, so the cache step is driven by
 # desired state rather than by which rows this attempt happened to change. A retry after a
@@ -130,18 +132,21 @@ async def reconcile_team_access_group_membership(tx: AccessGroupSyncTx, team_id:
     written or deleted: a team with no row reconciles to an empty set, which detaches it
     from every group.
 
-    The team row is read here rather than passed in, under an advisory lock held for the
-    rest of the transaction. That is what makes concurrent writes to the same team
-    converge, since each mirror reconciles against the row as the transaction sees it
+    The team row is read here rather than passed in, with FOR UPDATE so its row lock is
+    held for the rest of the transaction. That is what makes concurrent writes to the same
+    team converge, since each mirror reconciles against the row as the transaction sees it
     instead of against the snapshot its own caller happened to see. It also means a retry
     heals a sync that failed partway, where a before/after delta would compute nothing.
+
+    A team with no row locks nothing, so this detach-all pass is not serialized against a
+    concurrent /team/new re-creating the same team_id in that instant; the mirror can
+    transiently diverge in that window and heals on the team's next reconcile.
 
     Both mirror statements are set-based and mutate the array inside the statement, so a
     concurrent write for a different team cannot be lost the way a read-modify-write of
     the whole array can, and the pair commits together or not at all.
     """
-    await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, team_id)
-    team_rows: Final = _TeamRows.validate_python(await tx.query_raw(_READ_TEAM_SQL, team_id))
+    team_rows: Final = _TeamRows.validate_python(await tx.query_raw(_LOCK_AND_READ_TEAM_SQL, team_id))
     desired: Final = (team_rows[0].access_group_ids or ()) if team_rows else ()
     affected: Final = _AffectedGroups.validate_python(await tx.query_raw(_AFFECTED_SQL, team_id, desired))
     await tx.query_raw(_ATTACH_SQL, team_id, desired)

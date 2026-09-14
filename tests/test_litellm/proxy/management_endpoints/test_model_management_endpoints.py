@@ -4954,9 +4954,13 @@ class TestStrategyRouterWriteValidation:
             return self
 
         async def query_raw(self, sql: str, *args: object) -> list[dict[str, object]]:
+            if "pg_advisory" in sql:
+                raise NotImplementedError("unknown function: pg_advisory_xact_lock()")
             self.raw_calls.append((sql, args))
             if "AS litellm_params" in sql:
                 return [row for row in self.tuning_rows if row.get("model_id") != args[0]]
+            if "AS locked" in sql:
+                return [{"locked": args[0]}]
             return [{"model": model} for model in self.db_models] if "AS model" in sql else []
 
         async def __aenter__(self) -> "TestStrategyRouterWriteValidation._FakeTx":
@@ -5085,7 +5089,7 @@ class TestStrategyRouterWriteValidation:
         from fastapi import HTTPException
 
         from litellm.proxy.management_endpoints.model_management_endpoints import (
-            AUTO_ROUTER_CAPABILITY_SLOT_LOCK_KEY,
+            AUTO_ROUTER_CAPABILITY_SLOT_LOCK_PARAM,
             _auto_router_capability_slot,
         )
         from litellm.router_utils.auto_router_model_naming import gated_capability_of
@@ -5122,12 +5126,94 @@ class TestStrategyRouterWriteValidation:
         assert handle is fake.tx_obj.litellm_proxymodeltable
         published.assert_awaited_once_with(redis_cache=None, object_type="litellm_proxymodeltable")
         (lock_sql, lock_params), (count_sql, count_params) = fake.tx_obj.raw_calls
-        assert "pg_advisory_xact_lock($1)" in lock_sql and "count" not in lock_sql
-        assert lock_params == (AUTO_ROUTER_CAPABILITY_SLOT_LOCK_KEY,)
+        assert "pg_advisory" not in lock_sql and "count" not in lock_sql
+        assert '"LiteLLM_Config"' in lock_sql and "ON CONFLICT" in lock_sql and "RETURNING" in lock_sql
+        assert lock_params == (AUTO_ROUTER_CAPABILITY_SLOT_LOCK_PARAM,)
         assert count_params == (model_id or "",)
         assert "AS model" in count_sql
         assert capability is not None
         assert capability.sql_config_predicate.split("{config}")[-1].strip() in count_sql
+
+    @pytest.mark.asyncio
+    async def test_capability_slot_serializes_concurrent_claims_via_sentinel_row_lock(self) -> None:
+        """Two pods racing for the last slot must not both pass the count. The locking statement
+        upserts and row-locks the LiteLLM_Config sentinel (portable to CockroachDB, which has no
+        pg_advisory functions; the double rejects those the way CockroachDB does), so the second
+        claim counts only after the first commit and sees its row. Drop the lock and both claims
+        count zero holders and both slip past a limit of 1."""
+        from fastapi import HTTPException
+
+        from litellm.proxy.management_endpoints.model_management_endpoints import _auto_router_capability_slot
+
+        effective_params = {"model": "auto_router/complexity_router", "complexity_router_config": self._V2}
+        committed_models: list[str] = []
+        locks: dict[object, asyncio.Lock] = {}
+
+        class _ModelTable:
+            def __init__(self, staged: list[str]) -> None:
+                self._staged = staged
+
+            async def create(self, data: Mapping[str, object]) -> None:
+                await asyncio.sleep(0.02)
+                self._staged.append("auto_router/complexity_router")
+
+        class _Tx:
+            def __init__(self) -> None:
+                self._held: asyncio.Lock | None = None
+                self._staged: list[str] = []
+                self.litellm_proxymodeltable = _ModelTable(self._staged)
+
+            async def __aenter__(self) -> "_Tx":
+                return self
+
+            async def __aexit__(self, *exc: object) -> None:
+                if not any(exc):
+                    committed_models.extend(self._staged)
+                if self._held is not None:
+                    self._held.release()
+                    self._held = None
+
+            async def query_raw(self, sql: str, *args: object) -> list[dict[str, object]]:
+                if "pg_advisory" in sql:
+                    raise NotImplementedError("unknown function: pg_advisory_xact_lock()")
+                if "AS locked" in sql:
+                    lock = locks.setdefault(args[0], asyncio.Lock())
+                    await lock.acquire()
+                    self._held = lock
+                    return [{"locked": args[0]}]
+                return [{"model": model} for model in committed_models]
+
+        class _Db:
+            def __init__(self) -> None:
+                self.db = self
+
+            def tx(self) -> _Tx:
+                return _Tx()
+
+        async def claim() -> str:
+            try:
+                async with _auto_router_capability_slot(
+                    _Db(), effective_params=effective_params, model_id=None
+                ) as table:
+                    await table.create(data={})
+            except HTTPException as exc:
+                assert exc.status_code == 403
+                return "refused"
+            return "claimed"
+
+        with (
+            patch("litellm.proxy.proxy_server._license_check.auto_router_capability_limit", lambda: 1),  # test-quality-ok: the guard reads the proxy license singleton with no injection seam
+            patch("litellm.proxy.proxy_server.llm_router", None),  # test-quality-ok: the guard reads the proxy router global with no injection seam
+            patch("litellm.proxy.proxy_server.heuristic_v1_tuning_baselines", None),  # test-quality-ok: baselines are a startup-loaded proxy global with no injection seam
+            patch(  # test-quality-ok: the cross-pod publish is a side effect outside the race under test
+                "litellm.proxy.management_endpoints.model_management_endpoints.publish_config_change",
+                new=AsyncMock(),
+            ),
+        ):
+            outcomes = await asyncio.gather(claim(), claim())
+
+        assert sorted(outcomes) == ["claimed", "refused"]
+        assert committed_models == ["auto_router/complexity_router"]
 
     _TUNED_A = {"classifier_type": "heuristic", "tiers": {"SIMPLE": "gpt-4o-mini", "MEDIUM": "gpt-4o"}}
     _TUNED_A_EDITED = {**_TUNED_A, "dimension_weights": {"codePresence": 0.9}}
@@ -5293,7 +5379,7 @@ class TestStrategyRouterWriteValidation:
     @pytest.mark.asyncio
     async def test_team_model_bookkeeping_runs_after_the_slot_is_released(self) -> None:
         """team_model_add needs a second pool connection, so it must run only after the slot transaction
-        (and its advisory lock) has closed; a pool-sized burst of team creates would otherwise stall on the
+        (and its sentinel-row lock) has closed; a pool-sized burst of team creates would otherwise stall on the
         lock holder waiting for a connection the waiters are occupying."""
         from contextlib import asynccontextmanager
 

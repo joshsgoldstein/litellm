@@ -187,12 +187,12 @@ async def test_a_concurrent_writer_cannot_replay_a_stale_team_row_over_a_newer_o
     """
     Two writers edit one team at once. Whichever team row commits last is the admin's
     final intent and the mirror must match it, so the mirror has to hold the team's
-    advisory lock across its read and its writes.
+    row lock across its read and its writes.
 
-    A second connection holds that lock and changes the team underneath, which pins the
-    interleaving instead of hoping a sleep lands in the gap. With the lock the sync waits
-    and then reads the new row. Without it the sync reads the old row and writes a group
-    the admin already moved off, which keeps granting to that team.
+    A second connection holds that row lock and changes the team underneath, which pins
+    the interleaving instead of hoping a sleep lands in the gap. With the lock the sync
+    waits and then reads the new row. Without it the sync reads the old row and writes a
+    group the admin already moved off, which keeps granting to that team.
     """
     from prisma import Prisma
 
@@ -215,11 +215,11 @@ async def test_a_concurrent_writer_cannot_replay_a_stale_team_row_over_a_newer_o
 
         try:
             async with blocker.tx(timeout=timedelta(seconds=30)) as held:
-                await held.query_raw("SELECT pg_advisory_xact_lock(hashtext($1)) IS NULL AS locked", TEAM)
+                await held.query_raw('SELECT team_id FROM "LiteLLM_TeamTable" WHERE team_id = $1 FOR UPDATE', TEAM)
                 task = asyncio.create_task(competing_sync())
                 await sync_started.wait()
                 await asyncio.sleep(0.2)
-                assert not task.done(), "the mirror did not wait on the team's advisory lock"
+                assert not task.done(), "the mirror did not wait on the team's row lock"
                 await held.execute_raw(
                     'UPDATE "LiteLLM_TeamTable" SET access_group_ids = $1 WHERE team_id = $2',
                     [GROUPS[1]],

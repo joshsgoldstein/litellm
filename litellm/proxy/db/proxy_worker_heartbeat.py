@@ -37,12 +37,12 @@ ON CONFLICT (worker_id) DO UPDATE SET last_heartbeat_at = NOW()
 
 PRUNE_SQL: Final = """
 DELETE FROM "LiteLLM_ProxyWorkerHeartbeat"
-WHERE last_heartbeat_at < NOW() - make_interval(secs => $1)
+WHERE last_heartbeat_at < NOW() - ($1 * INTERVAL '1 second')
 """
 
 COUNT_SQL: Final = """
 SELECT COUNT(*)::int AS live_workers FROM "LiteLLM_ProxyWorkerHeartbeat"
-WHERE last_heartbeat_at > NOW() - make_interval(secs => $1)
+WHERE last_heartbeat_at > NOW() - ($1 * INTERVAL '1 second')
 """
 
 DEREGISTER_SQL: Final = """

@@ -887,14 +887,18 @@ def _encrypted_user_env_blob(values: dict) -> str:
     return encrypt_value_helper(json.dumps(values))
 
 
-def _transactional_env_vars_prisma(read_delay: float = 0.0):
-    """A prisma stand-in backed by an in-memory store that honours
-    ``db.tx()`` and the ``pg_advisory_xact_lock`` advisory lock.
+def _transactional_env_vars_prisma(write_delay: float = 0.0):
+    """A prisma stand-in backed by an in-memory store that honours ``db.tx()``
+    and row locking the way PostgreSQL and CockroachDB do: the merge's
+    ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` statement seeds the row if
+    missing and holds its row lock until the transaction closes, and any
+    ``pg_advisory_*`` call is rejected the way CockroachDB rejects it, so a
+    regression back to advisory locks fails every merge test using this double.
 
-    ``read_delay`` inserts an ``await`` point inside ``find_unique`` so two
-    concurrent merges interleave between their read and write; the advisory lock
-    is what keeps them from clobbering each other. Drop the lock and the second
-    write wins, losing the first update.
+    ``write_delay`` inserts an ``await`` point between a merge's locking read and
+    its write so two concurrent merges interleave; the row lock is what keeps
+    them from clobbering each other. Drop the lock and the second write wins,
+    losing the first update.
     """
     import asyncio
     from unittest.mock import MagicMock
@@ -913,20 +917,22 @@ def _transactional_env_vars_prisma(read_delay: float = 0.0):
             ident = where["user_id_server_id"]
             key = (ident["user_id"], ident["server_id"])
             blob = self._store.rows.get(key)
-            # Yield after capturing the read so an unserialised concurrent merge
-            # would race on this stale snapshot.
-            if self._delay:
-                await asyncio.sleep(self._delay)
             if blob is None:
                 return None
             row = MagicMock()
             row.values_b64 = blob
             return row
 
-        async def upsert(self, where, data):
+        async def update(self, where, data):
             ident = where["user_id_server_id"]
             key = (ident["user_id"], ident["server_id"])
-            self._store.rows[key] = data["update"]["values_b64"]
+            # Yield before applying the write so an unserialised concurrent merge
+            # would race on the stale value its locking read captured.
+            if self._delay:
+                await asyncio.sleep(self._delay)
+            if key not in self._store.rows:
+                raise KeyError(key)
+            self._store.rows[key] = data["values_b64"]
 
         async def delete_many(self, where):
             self._store.rows.pop((where["user_id"], where["server_id"]), None)
@@ -946,12 +952,21 @@ def _transactional_env_vars_prisma(read_delay: float = 0.0):
                 self._held = None
             return False
 
-        async def execute_raw(self, query, *args):
-            lock_key = args[0]
-            lock = self._store.locks.setdefault(lock_key, asyncio.Lock())
+        async def query_raw(self, query, *args):
+            if "pg_advisory" in query:
+                raise NotImplementedError("unknown function: pg_advisory_xact_lock()")
+            assert "ON CONFLICT" in query and "RETURNING" in query
+            key = (args[1], args[2])
+            lock = self._store.locks.setdefault(key, asyncio.Lock())
             await lock.acquire()
             self._held = lock
-            return 1
+            self._store.rows.setdefault(key, "")
+            return [{"values_b64": self._store.rows[key]}]
+
+        async def execute_raw(self, query, *args):
+            if "pg_advisory" in query:
+                raise NotImplementedError("unknown function: pg_advisory_xact_lock()")
+            return 0
 
     class _DB:
         def __init__(self, store, delay):
@@ -966,7 +981,7 @@ def _transactional_env_vars_prisma(read_delay: float = 0.0):
         def __init__(self, delay):
             self.db = _DB(_Store(), delay)
 
-    return _Prisma(read_delay)
+    return _Prisma(write_delay)
 
 
 @pytest.mark.asyncio
@@ -1117,8 +1132,10 @@ async def test_merge_user_env_vars_preserves_existing_and_prunes_disallowed(
 @pytest.mark.asyncio
 async def test_merge_user_env_vars_serializes_concurrent_writes(env_vars_salt_key):
     """Two simultaneous merges for the same (user, server) must not lose an
-    update: the advisory-locked transaction serialises the read-modify-write so
-    both distinct values survive."""
+    update: the row-locked transaction serialises the read-modify-write so both
+    distinct values survive. The store starts empty, so this is also the
+    first-write race where a plain ``SELECT ... FOR UPDATE`` would lock nothing;
+    the locking statement must seed the row to have something to lock."""
     import asyncio
 
     from litellm.proxy._experimental.mcp_server.db import (
@@ -1127,7 +1144,7 @@ async def test_merge_user_env_vars_serializes_concurrent_writes(env_vars_salt_ke
     )
 
     allowed = {"TOKEN_A", "TOKEN_B"}
-    prisma = _transactional_env_vars_prisma(read_delay=0.02)
+    prisma = _transactional_env_vars_prisma(write_delay=0.02)
 
     await asyncio.gather(
         merge_user_env_vars(prisma, "alice", "srv-1", {"TOKEN_A": "a"}, allowed),
@@ -1139,54 +1156,14 @@ async def test_merge_user_env_vars_serializes_concurrent_writes(env_vars_salt_ke
 
 
 @pytest.mark.asyncio
-async def test_merge_user_env_vars_acquires_lock_without_deserializing_void(
-    env_vars_salt_key,
-):
-    """``pg_advisory_xact_lock`` returns ``void``; running it through ``query_raw``
-    makes Prisma try to deserialize that column and raises ``RawQueryError``. The
-    lock must be taken via ``execute_raw`` (no result-set deserialization) so the
-    merge still completes."""
-    from unittest.mock import MagicMock
-
-    from prisma.errors import RawQueryError
-
+async def test_merge_user_env_vars_needs_no_advisory_lock_functions(env_vars_salt_key):
+    """CockroachDB has no ``pg_advisory_*`` functions, so the merge must serialise
+    itself with portable row locking only. The double raises the CockroachDB
+    error for any advisory-lock SQL, on both raw entry points, so reintroducing
+    ``pg_advisory_xact_lock`` fails this merge outright."""
     from litellm.proxy._experimental.mcp_server.db import merge_user_env_vars
 
-    class _Tx:
-        def __init__(self):
-            self.stored = None
-            self.litellm_mcpuserenvvars = self
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def query_raw(self, query, *args):
-            raise RawQueryError(
-                {
-                    "user_facing_error": {
-                        "error_code": "P2010",
-                        "meta": {
-                            "message": "Failed to deserialize column of type 'void'."
-                        },
-                    }
-                }
-            )
-
-        async def execute_raw(self, query, *args):
-            return 1
-
-        async def find_unique(self, where):
-            return None
-
-        async def upsert(self, where, data):
-            self.stored = data["create"]["values_b64"]
-
-    tx = _Tx()
-    prisma = MagicMock()
-    prisma.db.tx = MagicMock(return_value=tx)
+    prisma = _transactional_env_vars_prisma()
 
     values = {"CORP_TOKEN": "t0ken"}
     merged = await merge_user_env_vars(
@@ -1194,7 +1171,38 @@ async def test_merge_user_env_vars_acquires_lock_without_deserializing_void(
     )
 
     assert merged == values
-    assert tx.stored is not None
+    with pytest.raises(NotImplementedError):
+        await prisma.db.tx().query_raw("SELECT pg_advisory_xact_lock($1::bigint)", 1)
+    with pytest.raises(NotImplementedError):
+        await prisma.db.tx().execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", 1)
+
+
+@pytest.mark.asyncio
+async def test_merge_user_env_vars_first_write_seeds_row_without_decrypt_warning(
+    env_vars_salt_key, monkeypatch
+):
+    """A user's very first merge seeds the row through the locking statement; its
+    placeholder blob must decode as "no values yet", not trip the salt-rotation
+    warning meant for real undecryptable data."""
+    from unittest.mock import MagicMock
+
+    import litellm.proxy._experimental.mcp_server.db as mcp_db
+    from litellm.proxy._experimental.mcp_server.db import (
+        get_user_env_vars,
+        merge_user_env_vars,
+    )
+
+    logger = MagicMock()
+    monkeypatch.setattr(mcp_db, "verbose_proxy_logger", logger)
+
+    prisma = _transactional_env_vars_prisma()
+    merged = await merge_user_env_vars(
+        prisma, "alice", "srv-1", {"TOKEN": "t"}, allowed_names={"TOKEN"}
+    )
+
+    assert merged == {"TOKEN": "t"}
+    assert await get_user_env_vars(prisma, "alice", "srv-1") == {"TOKEN": "t"}
+    logger.warning.assert_not_called()
 
 
 @pytest.mark.asyncio

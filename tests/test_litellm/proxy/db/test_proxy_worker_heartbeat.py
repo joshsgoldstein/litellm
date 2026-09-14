@@ -87,6 +87,12 @@ async def test_count_returns_unknown_when_the_query_fails():
     assert await count_live_proxy_workers(prisma) is None
 
 
+@pytest.mark.parametrize("sql", (BEAT_SQL, PRUNE_SQL, COUNT_SQL, DEREGISTER_SQL))
+def test_sql_stays_portable_to_cockroachdb(sql):
+    assert "make_interval" not in sql.lower()
+    assert "=>" not in sql
+
+
 @pytest.mark.asyncio
 async def test_count_returns_unknown_for_a_malformed_row():
     prisma = _prisma()
