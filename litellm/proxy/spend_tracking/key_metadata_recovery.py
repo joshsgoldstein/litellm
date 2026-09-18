@@ -17,22 +17,19 @@ from litellm.constants import (
     SPEND_LOG_KEY_METADATA_QUERY_TIMEOUT_MS,
 )
 from litellm.litellm_core_utils.litellm_logging import is_valid_sha256_hash
-from litellm.proxy.utils import PrismaClient
+from litellm.proxy.utils import PrismaClient, hash_token
 from litellm.repositories.user_repository import UserRepository
 
 _T = TypeVar("_T")
 
-_ACTIVE_TOKEN_DIGEST_SQL: Final = """
-SELECT encode(sha256(convert_to(token, 'UTF8')), 'hex') AS digest, key_alias, team_id, user_id
+_ACTIVE_TOKEN_ROWS_SQL: Final = """
+SELECT token, key_alias, team_id, user_id
 FROM "LiteLLM_VerificationToken"
-WHERE encode(sha256(convert_to(token, 'UTF8')), 'hex') = ANY($1::text[])
 """
 
-_DELETED_TOKEN_DIGEST_SQL: Final = """
-SELECT DISTINCT ON (token)
-    encode(sha256(convert_to(token, 'UTF8')), 'hex') AS digest, key_alias, team_id, user_id
+_DELETED_TOKEN_ROWS_SQL: Final = """
+SELECT DISTINCT ON (token) token, key_alias, team_id, user_id
 FROM "LiteLLM_DeletedVerificationToken"
-WHERE encode(sha256(convert_to(token, 'UTF8')), 'hex') = ANY($1::text[])
 ORDER BY token, deleted_at DESC
 """
 
@@ -71,8 +68,8 @@ class KeyMetadataDict(TypedDict, total=False):
     user_email: ReadOnly[str | None]
 
 
-class _TokenDigestRow(BaseModel):
-    digest: str
+class _TokenMetadataRow(BaseModel):
+    token: str
     key_alias: str | None = None
     team_id: str | None = None
     user_id: str | None = None
@@ -99,7 +96,7 @@ class _SpendLogDigestRow(BaseModel):
         )
 
 
-_TOKEN_DIGEST_ROWS: Final = TypeAdapter(tuple[_TokenDigestRow, ...])
+_TOKEN_METADATA_ROWS: Final = TypeAdapter(tuple[_TokenMetadataRow, ...])
 _SPEND_LOG_DIGEST_ROWS: Final = TypeAdapter(tuple[_SpendLogDigestRow, ...])
 _CACHED_KEY_METADATA: Final = TypeAdapter(KeyMetadataDict)
 _SPEND_LOG_METADATA_CACHE: Final = InMemoryCache(
@@ -133,7 +130,7 @@ async def _reverse_hash_key_metadata(
     warning: str,
 ) -> Mapping[str, KeyMetadataDict]:
     rows: Final = await _db_or_empty(
-        lambda: prisma_client.db.query_raw(sql, sorted(wanted)),
+        lambda: prisma_client.db.query_raw(sql),
         warning,
         len(wanted),
     )
@@ -141,9 +138,10 @@ async def _reverse_hash_key_metadata(
         return _EMPTY_KEY_METADATA
     return MappingProxyType(
         {
-            row.digest: KeyMetadataDict(key_alias=row.key_alias, team_id=row.team_id, user_id=row.user_id)
-            for row in _TOKEN_DIGEST_ROWS.validate_python(rows)
-            if row.digest in wanted
+            digest: KeyMetadataDict(key_alias=row.key_alias, team_id=row.team_id, user_id=row.user_id)
+            for row in _TOKEN_METADATA_ROWS.validate_python(rows)
+            for digest in (hash_token(row.token),)
+            if digest in wanted
         }
     )
 
@@ -208,7 +206,7 @@ async def recover_double_hashed_key_metadata(
 
     from_active: Final = await _reverse_hash_key_metadata(
         prisma_client,
-        _ACTIVE_TOKEN_DIGEST_SQL,
+        _ACTIVE_TOKEN_ROWS_SQL,
         sha_missing,
         warning="Failed reverse-hash recovery against active keys for %d missing keys: %s",
     )
@@ -217,7 +215,7 @@ async def recover_double_hashed_key_metadata(
         return from_active
     from_deleted: Final = await _reverse_hash_key_metadata(
         prisma_client,
-        _DELETED_TOKEN_DIGEST_SQL,
+        _DELETED_TOKEN_ROWS_SQL,
         still_missing,
         warning="Failed reverse-hash recovery against deleted keys for %d missing keys: %s",
     )

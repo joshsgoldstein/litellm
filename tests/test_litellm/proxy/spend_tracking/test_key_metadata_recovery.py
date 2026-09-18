@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import time
 from collections.abc import Sequence
 from datetime import datetime, timedelta
@@ -22,8 +23,8 @@ from litellm.proxy.spend_tracking.key_metadata_recovery import (
 from litellm.proxy.utils import hash_token
 
 
-def _digest_row(digest: str, key_alias: str | None, team_id: str | None, user_id: str | None) -> dict[str, str | None]:
-    return {"digest": digest, "key_alias": key_alias, "team_id": team_id, "user_id": user_id}
+def _token_row(token: str, key_alias: str | None, team_id: str | None, user_id: str | None) -> dict[str, str | None]:
+    return {"token": token, "key_alias": key_alias, "team_id": team_id, "user_id": user_id}
 
 
 def _query_raw_spend_logs(rows: Sequence[dict[str, str | None]]) -> AsyncMock:
@@ -71,10 +72,11 @@ def _query_raw_by_table(
 
 @pytest.mark.asyncio
 async def test_recover_double_hashed_key_metadata_via_active_token_digest():
-    double_hashed = hash_token("a" * 64)
+    stored_token = "a" * 64
+    double_hashed = hash_token(stored_token)
     mock_prisma = MagicMock()
     mock_prisma.db.query_raw = _query_raw_by_table(
-        active_rows=[_digest_row(double_hashed, "batch-worker", "team-1", "alice")],
+        active_rows=[_token_row(stored_token, "batch-worker", "team-1", "alice")],
         deleted_rows=[],
     )
 
@@ -83,17 +85,17 @@ async def test_recover_double_hashed_key_metadata_via_active_token_digest():
     assert result[double_hashed]["key_alias"] == "batch-worker"
     assert result[double_hashed]["team_id"] == "team-1"
     assert result[double_hashed]["user_id"] == "alice"
-    ((_, digests),) = [call.args for call in mock_prisma.db.query_raw.call_args_list]
-    assert digests == [double_hashed]
+    assert mock_prisma.db.query_raw.await_count == 1
 
 
 @pytest.mark.asyncio
 async def test_recover_double_hashed_key_metadata_falls_back_to_deleted_tokens():
-    double_hashed = hash_token("y" * 64)
+    stored_token = "y" * 64
+    double_hashed = hash_token(stored_token)
     mock_prisma = MagicMock()
     mock_prisma.db.query_raw = _query_raw_by_table(
         active_rows=[],
-        deleted_rows=[_digest_row(double_hashed, "deleted-key", "team-del", "erin")],
+        deleted_rows=[_token_row(stored_token, "deleted-key", "team-del", "erin")],
     )
 
     result = await recover_double_hashed_key_metadata(mock_prisma, {double_hashed})
@@ -101,27 +103,26 @@ async def test_recover_double_hashed_key_metadata_falls_back_to_deleted_tokens()
     assert result[double_hashed]["key_alias"] == "deleted-key"
     assert result[double_hashed]["team_id"] == "team-del"
     assert result[double_hashed]["user_id"] == "erin"
-    assert [call.args[1] for call in mock_prisma.db.query_raw.call_args_list] == [[double_hashed], [double_hashed]]
+    assert mock_prisma.db.query_raw.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_recover_only_asks_deleted_tokens_for_digests_active_keys_missed():
-    found_active = hash_token("1" * 64)
-    found_deleted = hash_token("2" * 64)
+    active_token = "1" * 64
+    deleted_token = "2" * 64
+    found_active = hash_token(active_token)
+    found_deleted = hash_token(deleted_token)
     mock_prisma = MagicMock()
     mock_prisma.db.query_raw = _query_raw_by_table(
-        active_rows=[_digest_row(found_active, "active-key", None, None)],
-        deleted_rows=[_digest_row(found_deleted, "deleted-key", None, None)],
+        active_rows=[_token_row(active_token, "active-key", None, None)],
+        deleted_rows=[_token_row(deleted_token, "deleted-key", None, None)],
     )
 
     result = await recover_double_hashed_key_metadata(mock_prisma, {found_active, found_deleted})
 
     assert result[found_active]["key_alias"] == "active-key"
     assert result[found_deleted]["key_alias"] == "deleted-key"
-    assert [call.args[1] for call in mock_prisma.db.query_raw.call_args_list] == [
-        sorted((found_active, found_deleted)),
-        [found_deleted],
-    ]
+    assert mock_prisma.db.query_raw.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -161,11 +162,51 @@ async def test_recover_returns_empty_when_digest_lookup_raises_prisma_error():
 
 
 @pytest.mark.asyncio
-async def test_fill_missing_api_key_aliases_updates_null_alias_and_email_rows():
-    double_hashed = hash_token("d" * 64)
+async def test_recovery_digest_matches_hashlib_sha256_hexdigest_of_the_stored_token():
+    active_token = "0a" * 32
+    deleted_token = "1b" * 32
+    active_digest = hashlib.sha256(active_token.encode("utf-8")).hexdigest()
+    deleted_digest = hashlib.sha256(deleted_token.encode("utf-8")).hexdigest()
     mock_prisma = MagicMock()
     mock_prisma.db.query_raw = _query_raw_by_table(
-        active_rows=[_digest_row(double_hashed, "recovered-alias", "team-9", "bob")],
+        active_rows=[_token_row(active_token, "active-alias", None, None)],
+        deleted_rows=[_token_row(deleted_token, "deleted-alias", None, None)],
+    )
+
+    result = await recover_double_hashed_key_metadata(mock_prisma, {active_digest, deleted_digest})
+
+    assert result[active_digest]["key_alias"] == "active-alias"
+    assert result[deleted_digest]["key_alias"] == "deleted-alias"
+
+
+@pytest.mark.asyncio
+async def test_token_lookup_sql_stays_portable_by_never_hashing_in_the_database():
+    stored_token = "2c" * 32
+    mock_prisma = MagicMock()
+    mock_prisma.db.query_raw = _query_raw_by_table(
+        active_rows=[],
+        deleted_rows=[_token_row(stored_token, "portable-alias", None, None)],
+    )
+
+    result = await recover_double_hashed_key_metadata(
+        mock_prisma, {hashlib.sha256(stored_token.encode("utf-8")).hexdigest()}
+    )
+
+    assert result[hashlib.sha256(stored_token.encode("utf-8")).hexdigest()]["key_alias"] == "portable-alias"
+    executed = [call.args[0] for call in mock_prisma.db.query_raw.call_args_list]
+    assert len(executed) == 2
+    assert all(
+        "sha256" not in sql and "encode(" not in sql and "convert_to" not in sql for sql in executed
+    ), executed
+
+
+@pytest.mark.asyncio
+async def test_fill_missing_api_key_aliases_updates_null_alias_and_email_rows():
+    stored_token = "d" * 64
+    double_hashed = hash_token(stored_token)
+    mock_prisma = MagicMock()
+    mock_prisma.db.query_raw = _query_raw_by_table(
+        active_rows=[_token_row(stored_token, "recovered-alias", "team-9", "bob")],
         deleted_rows=[],
     )
     mock_prisma.db.litellm_usertable.find_many = AsyncMock(
@@ -213,10 +254,11 @@ async def test_fill_missing_api_key_aliases_leaves_rows_untouched_when_nothing_i
 
 @pytest.mark.asyncio
 async def test_fill_missing_api_key_aliases_keeps_spend_user_email_when_alias_is_missing():
-    double_hashed = hash_token("f" * 64)
+    stored_token = "f" * 64
+    double_hashed = hash_token(stored_token)
     mock_prisma = MagicMock()
     mock_prisma.db.query_raw = _query_raw_by_table(
-        active_rows=[_digest_row(double_hashed, "team-key", "team-9", "key-owner")],
+        active_rows=[_token_row(stored_token, "team-key", "team-9", "key-owner")],
         deleted_rows=[],
     )
     mock_prisma.db.litellm_usertable.find_many = AsyncMock(
