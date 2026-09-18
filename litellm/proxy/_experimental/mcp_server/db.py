@@ -1,6 +1,5 @@
 import base64
 import binascii
-import hashlib
 import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -63,7 +62,7 @@ if TYPE_CHECKING:
 class _UserEnvVarsTransactionClient(Protocol):
     litellm_mcpuserenvvars: "TableActions[prisma_db_models.LiteLLM_MCPUserEnvVars]"
 
-    async def execute_raw(self, query: str, *args: object) -> int: ...
+    async def query_raw(self, query: str, *args: object) -> Sequence[Mapping[str, object]]: ...
 
 
 class _UserEnvVarsTransaction(Protocol):
@@ -2037,6 +2036,14 @@ async def get_user_env_vars_bulk(
     return {row.server_id: _decode_user_env_vars(row.values_b64) for row in rows}
 
 
+_ENV_VAR_ROW_LOCK_SQL: Final = (
+    'INSERT INTO "LiteLLM_MCPUserEnvVars" ("id", "user_id", "server_id", "values_b64") '
+    "VALUES ($1, $2, $3, '') "
+    'ON CONFLICT ("user_id", "server_id") DO UPDATE SET "values_b64" = "LiteLLM_MCPUserEnvVars"."values_b64" '
+    'RETURNING "values_b64"'
+)
+
+
 async def merge_user_env_vars(
     prisma_client: PrismaClient,
     user_id: str,
@@ -2047,35 +2054,23 @@ async def merge_user_env_vars(
     """Merge ``updates`` into the user's stored env vars for ``server_id`` and
     return the resulting set.
 
-    The read-modify-write runs inside a transaction guarded by a
-    ``(user_id, server_id)`` advisory lock so two concurrent writes from the
-    same user can't drop one update. Names outside ``allowed_names`` are pruned,
-    so an admin retiring a user-scoped variable also clears its stored value.
+    The read-modify-write runs inside a transaction that upserts and row-locks the
+    ``(user_id, server_id)`` row in one ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING``
+    statement (a plain ``SELECT ... FOR UPDATE`` would lock nothing on a user's first
+    write), so two concurrent writes from the same user can't drop one update. Names
+    outside ``allowed_names`` are pruned, so an admin retiring a user-scoped variable
+    also clears its stored value.
     """
     allowed: Final = set(allowed_names)
-    lock_key: Final = int.from_bytes(
-        hashlib.blake2b(f"{user_id}:{server_id}".encode(), digest_size=8).digest(),
-        "big",
-        signed=True,
-    )
     async with _db_transaction_manager(prisma_client) as tx:
-        await tx.execute_raw("SELECT pg_advisory_xact_lock($1::bigint)", lock_key)
-        row: Final[prisma_db_models.LiteLLM_MCPUserEnvVars | None] = await tx.litellm_mcpuserenvvars.find_unique(
-            where={"user_id_server_id": {"user_id": user_id, "server_id": server_id}}
-        )
-        existing: Final = _decode_user_env_vars(row.values_b64) if row is not None else {}
+        locked_rows: Final = await tx.query_raw(_ENV_VAR_ROW_LOCK_SQL, str(uuid.uuid4()), user_id, server_id)
+        stored_blob: Final = locked_rows[0].get("values_b64") if locked_rows else None
+        existing: Final = _decode_user_env_vars(stored_blob) if isinstance(stored_blob, str) else {}
         merged: Final = {k: v for k, v in {**existing, **updates}.items() if k in allowed}
         encoded: Final = encrypt_value_helper(json.dumps(merged))
-        await tx.litellm_mcpuserenvvars.upsert(
+        await tx.litellm_mcpuserenvvars.update(
             where={"user_id_server_id": {"user_id": user_id, "server_id": server_id}},
-            data={
-                "create": {
-                    "user_id": user_id,
-                    "server_id": server_id,
-                    "values_b64": encoded,
-                },
-                "update": {"values_b64": encoded},
-            },
+            data={"values_b64": encoded},
         )
     return merged
 
