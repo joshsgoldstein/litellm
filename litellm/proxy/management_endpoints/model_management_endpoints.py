@@ -293,8 +293,12 @@ def _raise_on_strategy_router_write_violation(
     )
 
 
-AUTO_ROUTER_CAPABILITY_SLOT_LOCK_KEY: Final = 5_872_301
-_CAPABILITY_LOCK_SQL: Final = "SELECT 1 AS locked FROM pg_advisory_xact_lock($1)"
+AUTO_ROUTER_CAPABILITY_SLOT_LOCK_PARAM: Final = "auto_router_capability_slot_lock"
+_CAPABILITY_LOCK_SQL: Final = (
+    'INSERT INTO "LiteLLM_Config" ("param_name") VALUES ($1) '
+    'ON CONFLICT ("param_name") DO UPDATE SET "reload_revision" = "LiteLLM_Config"."reload_revision" '
+    'RETURNING "param_name" AS locked'
+)
 _STORED_LITELLM_PARAMS_SQL: Final = (
     "(CASE jsonb_typeof(litellm_params) WHEN 'string' THEN (litellm_params #>> '{}')::jsonb ELSE litellm_params END)"
 )
@@ -390,8 +394,10 @@ async def _auto_router_capability_slot(
     """Hand out the model table to write through while the row's claim on a licensed capability is settled.
 
     A write that leaves the row claiming a licensed capability under a limited license runs
-    inside one transaction that takes an advisory lock in its own statement before counting
-    (a statement's snapshot predates anything it locks), so pods cannot both pass the count:
+    inside one transaction that row-locks a dedicated ``LiteLLM_Config`` sentinel row (upserted
+    and locked by one ``INSERT ... ON CONFLICT DO UPDATE`` statement, so the very first claim
+    still has a row to lock) before counting (a statement's snapshot predates anything it
+    locks), so pods cannot both pass the count:
     the DB rows (any pod, either JSON shape) plus this proxy's config.yaml routers are judged
     against the license limit and the write is refused with a 403 before it happens. The row
     being edited keeps its own slot through ``model_id``. Every other write, and every write on
@@ -420,7 +426,7 @@ async def _auto_router_capability_slot(
         return
     async with prisma_client.db.tx() as tx_ctx:
         tables: Final[_TxModelTables] = tx_ctx
-        await tx_ctx.query_raw(_CAPABILITY_LOCK_SQL, AUTO_ROUTER_CAPABILITY_SLOT_LOCK_KEY)
+        await tx_ctx.query_raw(_CAPABILITY_LOCK_SQL, AUTO_ROUTER_CAPABILITY_SLOT_LOCK_PARAM)
         config_rows: Final = () if llm_router is None else tuple(llm_router.config_deployments())
         if capability is not None:
             rows: Sequence[Mapping[str, object]] = await tx_ctx.query_raw(
