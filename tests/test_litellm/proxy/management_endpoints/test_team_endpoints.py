@@ -59,7 +59,7 @@ from litellm.proxy.management_endpoints.team_endpoints import (
     validate_team_org_change,
 )
 from litellm.proxy.management_helpers.access_group_team_sync import (
-    TEAM_ADVISORY_LOCK_SQL,
+    TEAM_ROW_LOCK_SQL,
 )
 from litellm.proxy.management_helpers.team_member_permission_checks import (
     TeamMemberPermissionChecks,
@@ -80,7 +80,7 @@ def _wire_team_create_tx(prisma_client):
     """`/team/new` inserts the team and mirrors it onto the access groups in one transaction,
     so a mocked client has to hand its team table back out of `db.tx()`.
 
-    A `/team/new` carrying members then adds them under the team's advisory lock, and those
+    A `/team/new` carrying members then adds them under the team's row lock, and those
     writes run on that lock's transaction, so `tx()` has to hand back the mocked tables too
     for the per-table assertions on `prisma_client.db.*` to keep seeing them."""
 
@@ -96,9 +96,9 @@ def _wire_team_create_tx(prisma_client):
 
 
 def _wire_member_add_tx(prisma_client):
-    """/team/member_add takes the team's advisory lock, re-reads the roster under it, and runs
-    the user, budget, and membership writes on that same transaction, so a mocked client has
-    to hand its own table mocks back out of `tx()`.
+    """/team/member_add locks the team row via its roster re-read and runs the user, budget,
+    and membership writes on that same transaction, so a mocked client has to hand its own
+    table mocks back out of `tx()`.
 
     Tables resolve on access, not here, since tests routinely replace `db.<table>` after
     wiring the transaction."""
@@ -117,14 +117,18 @@ def _wire_member_add_tx(prisma_client):
 
 
 def _wire_member_delete_tx(prisma_client):
-    """/team/member_delete's four cleanups, plus the advisory-lock re-read that now guards
+    """/team/member_delete's four cleanups, plus the locked roster re-read that guards
     them, run inside one transaction, so a mocked client has to hand back its own table
     mocks (and a `query_raw` that answers the locked re-read from the same team row the
     test already configured on `find_unique`) out of `tx()` for the existing per-table
-    assertions to keep seeing the calls."""
+    assertions to keep seeing the calls.
+
+    Only a FOR UPDATE read gets an answer: the row lock is what serializes the delete
+    against concurrent member writes, so an unlocked re-read makes the team look gone
+    and every test through this harness fails."""
 
     async def _query_raw(sql, team_id):
-        if sql != TEAM_ADVISORY_LOCK_SQL:
+        if "FOR UPDATE" in sql:
             team_row = await prisma_client.db.litellm_teamtable.find_unique(where={"team_id": team_id})
             if team_row is not None:
                 return [{"members_with_roles": team_row.model_dump()["members_with_roles"]}]
@@ -145,7 +149,7 @@ def _wire_member_delete_tx(prisma_client):
 
 def _wire_team_delete_tx(prisma_client):
     """`/team/delete` deletes the team rows and runs its post-delete reference sweep under
-    every team's advisory lock in one transaction, so a mocked client has to hand its own
+    every team's row lock in one transaction, so a mocked client has to hand its own
     table mocks (and db-level execute_raw) back out of `tx()` for existing per-table
     assertions on `prisma_client.db.*` to keep seeing those calls."""
     tx = SimpleNamespace(
@@ -1867,7 +1871,7 @@ async def test_update_team_members_list_duplicate_prevention():
 async def test_add_team_members_reconciles_against_freshly_locked_row():
     """
     Regression: _add_team_members_to_team must build the new members_with_roles
-    from the row it re-reads under the team's advisory lock, not from the stale
+    from the row it re-reads under the team's row lock, not from the stale
     complete_team_data snapshot captured at the start of the request.
 
     Two concurrent /team/member_add calls for the same team read the same
@@ -1929,11 +1933,12 @@ async def test_add_team_members_reconciles_against_freshly_locked_row():
     written_ids = sorted(m["user_id"] for m in json.loads(captured["data"]["members_with_roles"]))
     assert written_ids == ["alice", "bob", "zed"]
 
-    assert tx.query_raw.call_args_list[0].args == (TEAM_ADVISORY_LOCK_SQL, "test-team-lock"), (
-        "expected the team's advisory lock to be acquired before the members_with_roles read"
+    first_sql, first_arg = tx.query_raw.call_args_list[0].args
+    assert "FOR UPDATE" in first_sql and first_arg == "test-team-lock", (
+        "the members_with_roles re-read must itself take the team's row lock, as the transaction's first statement"
     )
-    assert not any("FOR UPDATE" in str(call.args[0]) for call in tx.query_raw.call_args_list), (
-        "a row lock here can deadlock with the access-group endpoints; only the advisory lock is safe"
+    assert not any("pg_advisory" in str(call.args[0]) for call in tx.query_raw.call_args_list), (
+        "CockroachDB has no advisory locks; the team row lock is what serializes team writes"
     )
 
     assert [m.user_id for m in updated_team.members_with_roles] == ["zed", "alice", "bob"]
@@ -1942,10 +1947,10 @@ async def test_add_team_members_reconciles_against_freshly_locked_row():
 @pytest.mark.asyncio
 async def test_add_team_members_runs_member_writes_on_the_lock_holding_transaction():
     """
-    Regression pin against exhausting the connection pool with advisory-lock waiters.
+    Regression pin against exhausting the connection pool with row-lock waiters.
 
     Every concurrent /team/member_add for one team holds a pooled connection while it waits
-    on the team's advisory lock. If the holder's member writes went to the regular client,
+    on the team's row lock. If the holder's member writes went to the regular client,
     it would need a second connection to finish, so enough concurrent adds fill the pool
     with waiters and the holder can never commit or release the lock. The member writes
     therefore have to run on the transaction that already owns the connection.
@@ -2008,9 +2013,9 @@ async def test_add_team_members_writes_nothing_when_the_team_is_deleted_mid_requ
     """
     Regression pin for the /team/member_add vs /team/delete race.
 
-    The advisory lock is acquired, and the team is gone, before any write is attempted:
-    the empty locked SELECT is proof a /team/delete already committed under the same
-    lock, so this request must fail without writing the user or membership rows in the
+    The locked roster read runs, and the team is gone, before any write is attempted:
+    the empty FOR UPDATE SELECT is proof a /team/delete already committed under the same
+    row lock, so this request must fail without writing the user or membership rows in the
     first place, rather than writing them and then trying to sweep them back out.
     """
     from litellm.proxy.management_endpoints.team_endpoints import (
@@ -4731,10 +4736,10 @@ async def test_team_member_delete_reads_on_the_lock_holding_transaction(
     mock_db_client, mock_admin_auth
 ):
     """
-    Regression pin against exhausting the connection pool with advisory-lock waiters.
+    Regression pin against exhausting the connection pool with row-lock waiters.
 
     Every concurrent removal for one team holds a pooled connection while it waits on the
-    team's advisory lock, and /team/delete fans its per-member removals out concurrently.
+    team's row lock, and /team/delete fans its per-member removals out concurrently.
     A holder whose reads went to the regular client would need a second connection to
     finish, so enough waiters fill the pool and the holder can never release the lock.
     Both reads therefore have to run on the transaction that already owns the connection.
@@ -8364,7 +8369,7 @@ async def test_delete_team_sweeps_references_outside_members_with_roles(
     mock_prisma_client.db.tx = MagicMock(return_value=mock_tx_cm)
 
     # The locked delete-and-sweep transaction /team/member_add serializes against, kept
-    # separate from mock_tx above (the BYOK-model-cleanup transaction, unrelated to this lock).
+    # separate from mock_tx above (the BYOK-model-cleanup transaction, unrelated to these locks).
     _wire_team_delete_tx(mock_prisma_client)
     mock_lock_tx = mock_prisma_client.tx.return_value.__aenter__.return_value
 
@@ -8403,7 +8408,7 @@ async def test_delete_team_sweeps_references_outside_members_with_roles(
         call(_STRIP_DELETED_TEAM_FROM_USERS_SQL, "team-doomed"),
     ], (
         "the unlocked sweep must run once to catch pre-existing drift, and the locked sweep "
-        "(alongside the delete, under the same advisory lock member_add takes) must run again "
+        "(alongside the delete, under the same row lock member_add takes) must run again "
         "so a member_add that wrote its reference just before losing the lock is still reaped"
     )
 
@@ -8413,8 +8418,8 @@ async def test_delete_team_sweeps_references_outside_members_with_roles(
         call(where={"team_id": {"in": ("team-doomed",)}}),
     ]
 
-    assert mock_lock_tx.query_raw.await_args_list == [call(TEAM_ADVISORY_LOCK_SQL, "team-doomed")], (
-        "the advisory lock must be acquired before the team row is deleted"
+    assert mock_lock_tx.query_raw.await_args_list == [call(TEAM_ROW_LOCK_SQL, "team-doomed")], (
+        "the team row lock must be acquired before the row is deleted"
     )
 
     assert fresh_cache.get_cache(key="team_id:team-doomed") is None
@@ -8500,7 +8505,7 @@ async def test_delete_team_failing_locked_sweep_rolls_back_the_delete_and_leaves
 ):
     """
     The team delete and its post-delete reconcile sweep run inside one transaction, under the
-    team's advisory lock, so a sweep failure rolls the delete back with it rather than leaving
+    team's row lock, so a sweep failure rolls the delete back with it rather than leaving
     the row gone with the sweep half done. Cache eviction only runs after that transaction
     commits, so a failure here must leave the team exactly as it was: still in the db, and
     still cached. Evicting a cache entry for a delete that never actually committed would be
@@ -13246,11 +13251,9 @@ class _FakeMirrorDb:
 
     async def _query_raw(self, sql, *args):
         assert self._open, "mirror statement ran outside a transaction"
-        if "pg_advisory_xact_lock" in sql:
-            self.transactions[-1].append("lock")
-            return [{"locked": False}]
         if "LiteLLM_TeamTable" in sql:
-            self.transactions[-1].append("read")
+            assert "FOR UPDATE" in sql, "the mirror must lock the team row it reconciles against"
+            self.transactions[-1].append("locked_read")
             team_id = args[0]
             if team_id not in self._teams:
                 return []
@@ -13382,7 +13385,7 @@ async def test_update_team_syncs_access_group_assigned_team_ids_in_both_directio
     assert access_groups["ag-keep"]["assigned_team_ids"] == ["team-a"]
     assert access_groups["ag-other-team"]["assigned_team_ids"] == ["team-b"]
 
-    assert fake_db.transactions == [["lock", "read", "affected", "attach", "detach"]]
+    assert fake_db.transactions == [["locked_read", "affected", "attach", "detach"]]
     assert {call.args[0] for call in invalidate_cache.call_args_list} == {"ag-drop", "ag-keep", "ag-add"}
 
     async def _get_access_object(*, access_group_id, **_kwargs):
@@ -13464,7 +13467,7 @@ async def test_sync_reads_the_committed_team_row_rather_than_the_callers_snapsho
         assert access_groups == {"ag-1": ["team-b"], "ag-2": [], "ag-3": []}
         assert {call.args[0] for call in invalidate_cache.call_args_list} == {"ag-2", "ag-3"}
 
-    assert fake_db.transactions == [["lock", "read", "affected", "attach", "detach"]] * 3
+    assert fake_db.transactions == [["locked_read", "affected", "attach", "detach"]] * 3
 
 
 @pytest.mark.asyncio
@@ -13511,7 +13514,7 @@ async def test_new_team_and_delete_team_both_drive_the_mirror(
         )
 
     assert access_groups == {"ag-1": ["team-new"], "ag-2": []}
-    assert fake_db.transactions == [["create", "lock", "read", "affected", "attach", "detach"]]
+    assert fake_db.transactions == [["create", "locked_read", "affected", "attach", "detach"]]
     assert {call.args[0] for call in invalidate_cache.call_args_list} == {"ag-1"}
 
     team_row = LiteLLM_TeamTable(team_id="team-gone", models=[], access_group_ids=["ag-1"])

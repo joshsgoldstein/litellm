@@ -116,7 +116,7 @@ from litellm.proxy.management_endpoints.tag_management_endpoints import (
     get_daily_activity,
 )
 from litellm.proxy.management_helpers.access_group_team_sync import (
-    TEAM_ADVISORY_LOCK_SQL,
+    TEAM_ROW_LOCK_SQL,
     AccessGroupSyncTx,
     invalidate_access_group_caches,
     reconcile_team_access_group_membership,
@@ -314,7 +314,7 @@ class _TeamCreateTx(AccessGroupSyncTx, Protocol):
 
 
 class _MemberDeleteTx(Protocol):
-    """The tables `/team/member_delete` reads while it holds the team's advisory lock.
+    """The tables `/team/member_delete` reads while it holds the team's row lock.
 
     Reading them off the transaction keeps the whole endpoint on the one pooled connection
     it already checked out: a request that has the lock but still needs another connection
@@ -2801,14 +2801,14 @@ async def _add_team_members_to_team(
     user_api_key_dict: UserAPIKeyAuth,
     litellm_proxy_admin_name: str,
 ) -> tuple["prisma_models.LiteLLM_TeamTable", list[LiteLLM_UserTable], list[LiteLLM_TeamMembership]]:
-    """Add team members to the team, under the team's advisory lock.
+    """Add team members to the team, under the team's row lock.
 
-    The lock (``TEAM_ADVISORY_LOCK_SQL``, keyed on the team id) is taken first, and the
-    team is re-read under it before any write, so a delete that already committed is
-    visible here before this call writes anything: the user and membership writes only
-    happen once the re-read proves the team is still live. /team/delete takes the same
-    lock around its own sweep-and-delete, so the two can never interleave; whichever
-    acquires the lock first runs to completion before the other's re-read can proceed.
+    The locked re-read (``SELECT ... FOR UPDATE`` inside ``get_members_with_roles_locked``)
+    is the transaction's first statement, so a delete that already committed is visible
+    here before this call writes anything: the user and membership writes only happen once
+    the re-read proves the team is still live. /team/delete locks the same row around its
+    own sweep-and-delete, so the two can never interleave; whichever acquires the lock
+    first runs to completion before the other's re-read can proceed.
 
     The user and membership writes run on this transaction too, not on a second
     connection from the pool: a lock waiter that needs a connection it hasn't got yet is
@@ -2817,8 +2817,6 @@ async def _add_team_members_to_team(
     """
     gone_detail: Final[_ErrorDetail] = {"error": f"Team={data.team_id} was deleted while this member add was running"}
     async with prisma_client.tx() as tx:
-        await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, data.team_id)
-
         locked_members: Final = await TeamRepository(prisma_client).get_members_with_roles_locked(tx, data.team_id)
         if locked_members is None:
             raise HTTPException(status_code=404, detail=gone_detail)
@@ -3348,17 +3346,12 @@ async def team_member_delete(
         )
 
     ## DELETE MEMBER FROM TEAM
-    # Everything from here on runs under the team's advisory lock, the same one
-    # /team/member_add and /team/delete take: without it, this endpoint's own row-level
-    # update lock used to be the only thing serializing it against a concurrent member_add,
-    # and only by accident (their SELECT ... FOR UPDATE contended for the same row lock this
-    # UPDATE takes). Now that member_add reads under the advisory lock instead, this has to
-    # take it too, and re-read the roster under it rather than off the snapshot validated
-    # above, or a member_add that commits in between can have its addition silently
-    # overwritten by this delete computing from stale data.
+    # Everything from here on runs under the team's row lock, the same one
+    # /team/member_add and /team/delete take: the locked re-read below has to happen
+    # before any write, rather than trusting the snapshot validated above, or a
+    # member_add that commits in between can have its addition silently overwritten by
+    # this delete computing from stale data.
     async with prisma_client.tx() as tx:
-        await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, data.team_id)
-
         fresh_members: Final = await TeamRepository(prisma_client).get_members_with_roles_locked(tx, data.team_id)
         if fresh_members is None:
             raise HTTPException(
@@ -4102,17 +4095,18 @@ async def delete_team(
     await _sweep_deleted_team_references(team_ids=data.team_ids, prisma_client=prisma_client)
 
     ## DELETE TEAMS
-    # Both the delete and the reconcile sweep run under every team's advisory lock
-    # (TEAM_ADVISORY_LOCK_SQL, the same one /team/member_add takes before its own writes),
+    # Both the delete and the reconcile sweep run under every team's row lock
+    # (TEAM_ROW_LOCK_SQL, the same lock /team/member_add takes before its own writes),
     # sorted so two overlapping batch deletes always request their locks in the same order.
     # A member_add mid-flight for one of these teams either finishes its write and releases
     # the lock before this transaction starts, in which case this sweep reaches what it wrote,
     # or is still waiting on the lock, in which case its own re-read happens after this commits
-    # and sees the row gone before it writes anything.
+    # and sees the row gone before it writes anything. A team_id with no row locks nothing;
+    # delete_many skips it, so an already-absent id is simply a no-op here.
     delete_filter: Final[_TeamIdInFilter] = {"team_id": {"in": data.team_ids}}
     async with prisma_client.tx() as tx:
         for team_id in sorted(data.team_ids):
-            await tx.query_raw(TEAM_ADVISORY_LOCK_SQL, team_id)
+            await tx.query_raw(TEAM_ROW_LOCK_SQL, team_id)
         await tx.litellm_teamtable.delete_many(where=delete_filter)
         await _sweep_deleted_team_references_tx(team_ids=data.team_ids, tx=tx)
 
@@ -4159,7 +4153,7 @@ async def _sweep_deleted_team_references(team_ids: Sequence[str], prisma_client:
 
 async def _sweep_deleted_team_references_tx(team_ids: Sequence[str], tx: _TeamDeleteTx) -> None:
     """Same sweep as `_sweep_deleted_team_references`, run on the transaction that holds
-    every id's advisory lock and deletes the team rows, so it commits or rolls back with them."""
+    every id's row lock and deletes the team rows, so it commits or rolls back with them."""
     for team_id in team_ids:
         _ = await tx.execute_raw(_STRIP_DELETED_TEAM_FROM_USERS_SQL, team_id)
 

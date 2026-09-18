@@ -17,6 +17,7 @@ from litellm.proxy._types import (
     LitellmUserRoles,
     UserAPIKeyAuth,
 )
+from litellm.proxy.management_helpers.access_group_team_sync import TEAM_ROW_LOCK_SQL
 from litellm.proxy.proxy_server import app
 
 
@@ -127,12 +128,15 @@ def client_and_mocks(monkeypatch):
     mock_agents_table = MagicMock()
     mock_agents_table.find_many = AsyncMock(return_value=[])
 
+    mock_tx_query_raw = AsyncMock(return_value=[])
+
     @asynccontextmanager
     async def mock_tx():
         tx = types.SimpleNamespace(
             litellm_accessgrouptable=mock_access_group_table,
             litellm_teamtable=mock_team_table,
             litellm_verificationtoken=mock_key_table,
+            query_raw=mock_tx_query_raw,
         )
         yield tx
 
@@ -143,6 +147,7 @@ def client_and_mocks(monkeypatch):
         litellm_mcpservertable=mock_mcp_server_table,
         litellm_agentstable=mock_agents_table,
         tx=mock_tx,
+        query_raw=mock_tx_query_raw,
     )
     mock_prisma.db = mock_db
 
@@ -1633,3 +1638,89 @@ def test_update_access_group_response_carries_resolved_names(client_and_mocks):
     assert body["access_mcp_servers"] == [{"id": "mcp-new", "name": "Linear"}]
     assert body["access_agents"] == [{"id": "agent-a", "name": "support-bot"}]
     assert body["access_mcp_server_ids"] == ["mcp-new"]
+
+
+# ---------------------------------------------------------------------------
+# Lock ordering: team rows (sorted) before any access-group row write
+# ---------------------------------------------------------------------------
+
+
+def test_update_access_group_locks_affected_team_rows_before_the_group_row_write(client_and_mocks):
+    """Global lock order regression: the team endpoints lock a team row and then write
+    access-group rows, so an update here that wrote the group row while an affected team
+    row was still unlocked would deadlock with a concurrent team write. Added and removed
+    teams both belong to the affected set, and the locks must come sorted, first."""
+    client, mock_prisma, mock_access_group_table, *_ = client_and_mocks
+    mock_team_table = mock_prisma.db.litellm_teamtable
+
+    order = []
+
+    async def _record_lock(sql, team_id):
+        assert sql == TEAM_ROW_LOCK_SQL
+        order.append(f"lock:{team_id}")
+        return []
+
+    def _record_group_update(*, where, data):
+        order.append("group_update")
+        return _make_access_group_record(
+            access_group_id="ag-order", assigned_team_ids=data.get("assigned_team_ids", [])
+        )
+
+    mock_prisma.db.query_raw.side_effect = _record_lock
+    mock_access_group_table.update = AsyncMock(side_effect=_record_group_update)
+    mock_access_group_table.find_unique = AsyncMock(
+        return_value=_make_access_group_record(access_group_id="ag-order", assigned_team_ids=["team-b"])
+    )
+
+    records = {
+        "team-a": _make_team_record("team-a"),
+        "team-b": _make_team_record("team-b", ["ag-order"]),
+    }
+    mock_team_table.find_many = AsyncMock(return_value=list(records.values()))
+    mock_team_table.find_unique = AsyncMock(side_effect=lambda *, where: records.get(where["team_id"]))
+
+    resp = client.put("/v1/access_group/ag-order", json={"assigned_team_ids": ["team-a"]})
+    assert resp.status_code == 200
+
+    assert order[:3] == ["lock:team-a", "lock:team-b", "group_update"], (
+        "every affected team row must be locked, in sorted order, before the group row write"
+    )
+
+
+def test_delete_access_group_locks_affected_team_rows_before_any_write(client_and_mocks):
+    """Same global lock order on the delete path: the stored assigned_team_ids and the
+    teams carrying the group in access_group_ids are both affected, so both must be
+    locked, sorted, before the team updates and the group row delete."""
+    client, mock_prisma, mock_access_group_table, *_ = client_and_mocks
+    mock_team_table = mock_prisma.db.litellm_teamtable
+
+    order = []
+
+    async def _record_lock(sql, team_id):
+        assert sql == TEAM_ROW_LOCK_SQL
+        order.append(f"lock:{team_id}")
+        return []
+
+    def _record_team_update(*, where, data):
+        order.append("team_update")
+        return None
+
+    def _record_group_delete(*, where):
+        order.append("group_delete")
+        return None
+
+    mock_prisma.db.query_raw.side_effect = _record_lock
+    mock_team_table.update = AsyncMock(side_effect=_record_team_update)
+    mock_access_group_table.delete = AsyncMock(side_effect=_record_group_delete)
+    mock_access_group_table.find_unique = AsyncMock(
+        return_value=_make_access_group_record(access_group_id="ag-gone", assigned_team_ids=["team-b"])
+    )
+    mock_team_table.find_many = AsyncMock(return_value=[_make_team_record("team-a", ["ag-gone"])])
+    mock_team_table.find_unique = AsyncMock(return_value=None)
+
+    resp = client.delete("/v1/access_group/ag-gone")
+    assert resp.status_code == 204
+
+    assert order == ["lock:team-a", "lock:team-b", "team_update", "group_delete"], (
+        "both affected team rows must be locked, sorted, before the team updates and the group delete"
+    )

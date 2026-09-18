@@ -23,7 +23,10 @@ from litellm.proxy.auth.auth_checks import (
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
-from litellm.proxy.management_helpers.access_group_team_sync import invalidate_access_group_cache
+from litellm.proxy.management_helpers.access_group_team_sync import (
+    TEAM_ROW_LOCK_SQL,
+    invalidate_access_group_cache,
+)
 from litellm.proxy.management_helpers.resource_display_names import (
     agent_display_names,
     key_display_names,
@@ -118,6 +121,8 @@ class _AccessGroupTx(Protocol):
 
     @property
     def litellm_verificationtoken(self) -> _KeyTable: ...
+
+    async def query_raw(self, query: str, *args: object) -> Sequence[Mapping[str, object]]: ...
 
 
 def _require_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> None:
@@ -237,6 +242,19 @@ async def _attached_team_ids_for(
     if not records:
         return MappingProxyType({})
     return _attached_team_ids_by_group(records, await _teams_touching(team_table, records))
+
+
+async def _lock_team_rows(tx: _AccessGroupTx, team_ids: Sequence[str]) -> None:
+    """Lock the affected team rows before this transaction writes any access-group row.
+
+    Team rows first, in sorted team_id order, is the global lock order (see
+    ``TEAM_ROW_LOCK_SQL``): the team endpoints lock a team row and then write access-group
+    rows, so writing the group row here while an unlocked team row is still to come would
+    deadlock with them. An id whose row is gone locks nothing, and the sync helpers below
+    already skip missing teams.
+    """
+    for team_id in sorted(frozenset(team_ids)):
+        await tx.query_raw(TEAM_ROW_LOCK_SQL, team_id)
 
 
 async def _require_teams_exist(tx: _AccessGroupTx, team_ids: Sequence[str]) -> None:
@@ -460,6 +478,7 @@ async def create_access_group(
                     detail=f"Access group '{data.access_group_name}' already exists",
                 )
             await _require_teams_exist(tx, data.assigned_team_ids or ())
+            await _lock_team_rows(tx, data.assigned_team_ids or ())
 
             record: Final = await tx.litellm_accessgrouptable.create(
                 data={
@@ -608,6 +627,8 @@ async def update_access_group(
             keys_to_add = list(new_key_ids - old_key_ids)
             keys_to_remove = list(old_key_ids - new_key_ids)
 
+            await _lock_team_rows(tx, (*old_team_ids, *new_team_ids))
+
             record: Final = await tx.litellm_accessgrouptable.update(
                 where={"access_group_id": access_group_id},
                 data=update_data,
@@ -684,6 +705,8 @@ async def delete_access_group(
                 existing.assigned_key_ids or []
             )
             affected_key_tokens = list(all_affected_key_tokens)
+
+            await _lock_team_rows(tx, affected_team_ids)
 
             # Update teams returned by find_many directly — we already have their data.
             for team in teams_with_group:

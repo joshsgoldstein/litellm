@@ -79,22 +79,21 @@ class TeamRepository(BaseRepository[LiteLLM_TeamTable]):
         return LiteLLM_TeamTable.model_validate(data)
 
     async def get_members_with_roles_locked(self, tx: "Prisma", team_id: str) -> list[Member] | None:
-        """Return the team's members_with_roles. The caller must already hold
-        ``TEAM_ADVISORY_LOCK_SQL`` for this team_id on ``tx`` before calling this.
+        """Lock the team row for the rest of ``tx`` and return its members_with_roles.
 
-        ``None`` when the team row is gone, which is only possible under that lock if
-        a delete committed before this read, as opposed to ``[]`` for a team that
-        simply has no members.
+        ``None`` when the team row is gone (in which case nothing was locked), as
+        opposed to ``[]`` for a team that simply has no members, so a caller can fail
+        instead of writing when a delete committed before this read.
 
-        A plain read is enough here because the advisory lock, not a row lock, is what
-        serializes this against a concurrent writer: ``SELECT ... FOR UPDATE`` would
-        additionally take a row lock on ``LiteLLM_TeamTable``, and the access-group
-        endpoints lock an access group and then a team row, so a team-row-first lock
-        here can deadlock with them. The advisory lock cannot, since those endpoints
-        never take it.
+        The FOR UPDATE here is the team-write serialization callers rely on. It replaced
+        the Postgres-only advisory lock (CockroachDB has neither pg_advisory_xact_lock
+        nor hashtext) and is safe against the access-group endpoints' group-then-team
+        write order because those endpoints now lock the affected team rows before any
+        access-group row: team rows first, sorted when several, is the global lock order
+        (see ``TEAM_ROW_LOCK_SQL`` in ``access_group_team_sync``).
         """
         rows: Final = await tx.query_raw(
-            'SELECT members_with_roles FROM "LiteLLM_TeamTable" WHERE team_id = $1',
+            'SELECT members_with_roles FROM "LiteLLM_TeamTable" WHERE team_id = $1 FOR UPDATE',
             team_id,
         )
         if not rows:
