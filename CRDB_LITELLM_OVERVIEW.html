@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CockroachDB &times; LiteLLM</title>
+<style>
+  :root {
+    --purple: #9059ff;
+    --purple-dark: #502482;
+    --purple-light: #c8acff;
+    --ink: #16161a;
+    --muted: #5c5c66;
+    --paper: #ffffff;
+    --panel: #f7f6f2;
+    --line: #e4e2da;
+    --blue: #1a86c7;
+    --green: #4f7a1e;
+    --amber: #9a6a12;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #edecE6;
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 820px;
+    margin: 32px auto;
+    background: var(--paper);
+    box-shadow: 0 2px 24px rgba(0,0,0,0.10);
+  }
+
+  header.masthead {
+    background: linear-gradient(135deg, var(--purple-dark) 0%, var(--purple) 100%);
+    color: #fff;
+    padding: 44px 52px 40px;
+  }
+  .eyebrow {
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 11px;
+    font-weight: 700;
+    opacity: 0.85;
+    margin: 0 0 14px;
+  }
+  .lockup {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin: 0;
+  }
+  .lockup .mark {
+    width: 40px; height: 40px;
+    border-radius: 9px;
+    background: rgba(255,255,255,0.14);
+    border: 1px solid rgba(255,255,255,0.30);
+    display: flex; align-items: center; justify-content: center;
+    flex: 0 0 auto;
+  }
+  .lockup h1 {
+    font-size: 27px;
+    font-weight: 750;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  .lockup h1 .x { opacity: 0.6; font-weight: 400; padding: 0 4px; }
+  .subtitle {
+    margin: 18px 0 0;
+    font-size: 15.5px;
+    max-width: 60ch;
+    opacity: 0.95;
+  }
+  .masthead .meta {
+    margin-top: 22px;
+    font-size: 12.5px;
+    opacity: 0.8;
+  }
+
+  main { padding: 40px 52px 12px; }
+
+  h2.section {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--purple-dark);
+    border-bottom: 2px solid var(--line);
+    padding-bottom: 8px;
+    margin: 38px 0 18px;
+  }
+  p { margin: 0 0 14px; }
+  .lead { font-size: 16px; color: #2a2a30; }
+  strong { font-weight: 650; }
+
+  .card {
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--purple);
+    border-radius: 8px;
+    padding: 22px 24px;
+    margin: 0 0 20px;
+    background: var(--paper);
+  }
+  .card .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: var(--purple); color: #fff;
+    font-size: 13px; font-weight: 700;
+    margin-right: 10px; vertical-align: middle;
+  }
+  .card h3 {
+    display: inline; font-size: 18px; font-weight: 700; margin: 0;
+    vertical-align: middle;
+  }
+  .card .tag { margin: 8px 0 16px; color: var(--muted); font-style: italic; }
+  .row { margin: 0 0 9px; }
+  .row .k {
+    display: inline-block; min-width: 74px;
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--purple-dark);
+    vertical-align: top;
+  }
+  .row .v { display: inline; }
+  code {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 6px;
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+
+  .chip {
+    display: inline-block; font-size: 11.5px; font-weight: 650;
+    padding: 3px 10px; border-radius: 999px; vertical-align: middle;
+  }
+  .chip.dev   { background: #eadcff; color: var(--purple-dark); }
+  .chip.plan  { background: #e6eef5; color: var(--blue); }
+  .chip.scope { background: #fbf1dc; color: var(--amber); }
+
+  table.status {
+    width: 100%; border-collapse: collapse; margin: 6px 0 8px;
+    font-size: 14px;
+  }
+  table.status th, table.status td {
+    text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  table.status th {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); border-bottom: 2px solid var(--line);
+  }
+
+  .callout {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 16px 20px; margin: 4px 0 18px;
+    font-size: 14px;
+  }
+  .callout .lbl { font-weight: 700; color: var(--purple-dark); }
+
+  footer {
+    padding: 20px 52px 34px; color: var(--muted); font-size: 12px;
+    border-top: 1px solid var(--line); margin-top: 26px;
+  }
+  a { color: var(--purple-dark); }
+
+  @media print {
+    html, body { background: #fff; font-size: 11.5pt; }
+    .page { box-shadow: none; margin: 0; max-width: none; }
+    @page { size: A4; margin: 14mm 15mm; }
+    header.masthead { padding: 30px 34px; }
+    main { padding: 22px 34px 0; }
+    footer { padding: 16px 34px 0; }
+    .card, .callout, table.status { break-inside: avoid; }
+    h2.section { break-after: avoid; }
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Open-source integration</p>
+    <div class="lockup">
+      <span class="mark" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <ellipse cx="12" cy="6" rx="8" ry="3.2" stroke="#fff" stroke-width="1.6"/>
+          <path d="M4 6v12c0 1.77 3.58 3.2 8 3.2s8-1.43 8-3.2V6" stroke="#fff" stroke-width="1.6"/>
+          <path d="M4 12c0 1.77 3.58 3.2 8 3.2s8-1.43 8-3.2" stroke="#fff" stroke-width="1.6"/>
+        </svg>
+      </span>
+      <h1>CockroachDB <span class="x">&times;</span> LiteLLM</h1>
+    </div>
+    <p class="subtitle">Making CockroachDB a first-class option inside LiteLLM, the open-source
+      AI gateway, across three independent contributions.</p>
+    <div class="meta">Project overview &middot; contributed upstream to BerriAI/LiteLLM</div>
+  </header>
+
+  <main>
+
+    <h2 class="section">Context</h2>
+    <p class="lead">LiteLLM is a widely used open-source LLM gateway. Teams put it in front of many
+      model providers (OpenAI, Anthropic, Bedrock, Vertex, local models) to get one API, one set of
+      keys, and central spend tracking, budgets, and rate limits. Its proxy keeps all of that
+      operational state in a SQL database, which today is Postgres only.</p>
+    <p>We are making CockroachDB work with LiteLLM in three independent ways. They are separate
+      pieces of work and separate contributions; none depends on the others.</p>
+
+    <h2 class="section">The three additions</h2>
+
+    <div class="card">
+      <div><span class="num">1</span><h3>CockroachDB as the backing database</h3></div>
+      <p class="tag">The "spine", the store that holds keys, teams, users, budgets, and spend.</p>
+      <div class="row"><span class="k">What</span><span class="v">Let LiteLLM's proxy run its
+        operational store on CockroachDB in place of Postgres.</span></div>
+      <div class="row"><span class="k">Why</span><span class="v">This is the substantial one. It
+        lets an organization run LiteLLM on CockroachDB and get CRDB's resilience, scale, and
+        multi-region behavior for their AI gateway's control plane.</span></div>
+      <div class="row"><span class="k">How</span><span class="v">LiteLLM reaches its database
+        through Prisma, and most of its schema and queries are already portable. A small number of
+        Postgres-only constructs were not. We replaced five of them with standard equivalents that
+        behave identically on Postgres, so this is portability work, not a CockroachDB-specific
+        fork: a worker-heartbeat time calculation moved to standard SQL, a key-hashing step moved
+        from SQL into application code, and three uses of Postgres advisory locks were replaced with
+        standard row-level locking.</span></div>
+      <div class="row"><span class="k">Status</span><span class="v"><span class="chip dev">Development complete &middot; validation in progress</span></span></div>
+      <div class="row"><span class="k"></span><span class="v" style="color:var(--muted);font-size:13.5px">
+        Code complete, all lint and type checks pass, unit tests pass, and an end-to-end smoke test
+        succeeds on CockroachDB (proxy boot, key creation, real model completions, spend tracking,
+        team management). Full validation, concurrency and isolation behavior under load, is
+        underway with the integration team and is not yet complete.</span></div>
+      <div class="row"><span class="k">Isolation</span><span class="v">Runs on CockroachDB's default
+        (SERIALIZABLE); no configuration change required.</span></div>
+      <div class="row"><span class="k">Branch</span><span class="v"><code>litellm_crdb_backend</code></span></div>
+    </div>
+
+    <div class="card">
+      <div><span class="num">2</span><h3>CockroachDB in the connector list</h3></div>
+      <p class="tag">A first-class, recognizable option in the gateway's UI.</p>
+      <div class="row"><span class="k">What</span><span class="v">Add CockroachDB to the list of
+        well-known connectors LiteLLM shows when registering an MCP (Model Context Protocol)
+        server.</span></div>
+      <div class="row"><span class="k">Why</span><span class="v">Discoverability and first-class
+        presence, placing CockroachDB alongside the other recognized names users already see.</span></div>
+      <div class="row"><span class="k">How</span><span class="v">A small, backend-agnostic UI
+        addition. It has nothing to do with which database LiteLLM itself runs on.</span></div>
+      <div class="row"><span class="k">Status</span><span class="v"><span class="chip plan">Planned</span></span></div>
+    </div>
+
+    <div class="card">
+      <div><span class="num">3</span><h3>CockroachDB as a vector store</h3></div>
+      <p class="tag">Native vector search, usable through the same gateway.</p>
+      <div class="row"><span class="k">What</span><span class="v">Add CockroachDB as a supported
+        vector-store provider, using CockroachDB's native vector search for retrieval (RAG).</span></div>
+      <div class="row"><span class="k">Why</span><span class="v">It lets people use CockroachDB's
+        vector capabilities through the same LiteLLM gateway they already use for model calls.</span></div>
+      <div class="row"><span class="k">How</span><span class="v">A vector-store provider following
+        LiteLLM's existing plugin pattern, connecting with its own credentials.</span></div>
+      <div class="row"><span class="k">Status</span><span class="v"><span class="chip scope">Scoped &middot; one design decision open</span></span></div>
+      <div class="callout" style="margin-top:14px">
+        <span class="lbl">Deliberately decoupled from addition 1.</span> Someone can run LiteLLM on
+        Postgres (or anything) as its spine and still use CockroachDB purely as a vector store. The
+        vector store connects with its own credentials and never touches the proxy's main database
+        connection.
+      </div>
+    </div>
+
+    <h2 class="section">How they fit together</h2>
+    <p>They are independent. Each ships as its own pull request to the LiteLLM open-source project,
+      so they can be reviewed and merged on their own timelines. Addition 1 is the substantial one;
+      additions 2 and 3 are smaller and self-contained. Keeping them separate also means the vector
+      store (3) never implies you must run CockroachDB as your spine (1).</p>
+
+    <h2 class="section">Contribution approach</h2>
+    <p>We are contributing these upstream to the LiteLLM project rather than maintaining a private
+      fork, so the work lands in the product everyone uses. That means following the project's
+      contribution rules: one focused change per pull request, tests, passing the full lint and type
+      gates, and real end-to-end proof of each change. A corporate Contributor License Agreement is
+      in progress, which is the one legal prerequisite before anything can merge.</p>
+
+    <h2 class="section">Status at a glance</h2>
+    <table class="status">
+      <thead><tr><th>Addition</th><th>Status</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Backing database</strong></td>
+          <td><span class="chip dev">Dev complete</span></td>
+          <td>Validation (concurrency, isolation, scale) in progress with the integration team</td>
+        </tr>
+        <tr>
+          <td><strong>2. Connector list</strong></td>
+          <td><span class="chip plan">Planned</span></td>
+          <td>Small, backend-agnostic UI addition</td>
+        </tr>
+        <tr>
+          <td><strong>3. Vector store</strong></td>
+          <td><span class="chip scope">Scoped</span></td>
+          <td>Companion-service vs direct-SQL design decision open</td>
+        </tr>
+      </tbody>
+    </table>
+
+  </main>
+
+  <footer>
+    Prepared as a project overview for the CockroachDB &times; LiteLLM integration. For the
+    technical detail, see the compatibility assessment and the test plan that accompany this
+    document.
+  </footer>
+
+</div>
+</body>
+</html>
